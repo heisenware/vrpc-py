@@ -1,0 +1,24 @@
+# tests/agent/docker-compose.yml
+
+services:
+  broker:
+    build: ./fixtures/mosquitto
+    hostname: broker
+    environment:
+      - MOSQUITTO_USERNAME=Erwin
+      - MOSQUITTO_PASSWORD=12345
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1883"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  testrunner:
+    build:
+      context: ../../
+      dockerfile: tests/agent/Dockerfile
+    container_name: ${TEST_CONT}
+    depends_on:
+      broker:
+        condition: service_healthy
+    command: ["pytest", "tests/agent/test_agent.py", "-v"]

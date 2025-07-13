@@ -1,0 +1,12 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vrpc"
+version = "0.1.0"
+
+[tool.pytest.ini_options]
+norecursedirs = "tests/adapter/fixtures"

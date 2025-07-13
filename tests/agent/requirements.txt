@@ -1,0 +1,7 @@
+# tests/agent/requirements.txt
+gmqtt
+nanoid
+docstring-parser
+pytest
+pytest-asyncio
+pytest-mock
