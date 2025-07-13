@@ -115,7 +115,7 @@ class VrpcAgent(EventEmitter):
                 port=int(self.broker.split(":")[-1]),
                 username=self.username,
                 password=self.password,
-                identifier=self.mqtt_client_id,  # FIX: Was client_id
+                identifier=self.mqtt_client_id,
                 will=will,
                 tls_params=aiomqtt.TLSParameters() if "mqtts" in self.broker else None,
             ) as client:
@@ -128,8 +128,9 @@ class VrpcAgent(EventEmitter):
                     await self._handle_message(message)
         except aiomqtt.MqttError as error:
             logger.error(f"MQTT Connection Error: '{error}'.")
-            # Re-raise the error so tests can catch it
             raise
+        except asyncio.CancelledError:
+            logger.info("Agent serve task cancelled.")
 
     async def end(self, unregister: bool = False):
         """Stops the agent and disconnects from the broker."""
@@ -198,7 +199,7 @@ class VrpcAgent(EventEmitter):
         logger.debug(f"Agent received message on topic: {topic}")
         try:
             json_str = message.payload.decode("utf-8")
-            if not json_str:  # Handle empty retained messages on unregister
+            if not json_str:
                 return
             json_obj = json.loads(json_str)
             tokens = topic.split("/")
@@ -233,8 +234,10 @@ class VrpcAgent(EventEmitter):
                     await self._register_isolated_instance(instance_name, client_id)
             elif method == "__createShared__":
                 instance_name = result_obj.get("r")
-                if instance_name:
+                client_id = result_obj.get("s")
+                if instance_name and client_id:
                     await self._subscribe_to_instance_methods(class_name, instance_name)
+                    await self._register_shared_instance(instance_name, client_id)
                     await self._publish_class_info(class_name)
                     await self._publish_class_info_concise(class_name)
             elif method == "__delete__":
@@ -254,26 +257,39 @@ class VrpcAgent(EventEmitter):
     async def _handle_client_info_message(self, topic, json_obj):
         """Handles a client's status message (e.g., going offline)."""
         if json_obj.get("status") == "offline":
-            client_id = "/".join(topic.split("/")[1:-1])
+            client_id = topic.rpartition("/")[0]
             logger.info(f"Client '{client_id}' went offline, cleaning up resources.")
             if client_id in self._isolated_instances:
                 for instance_id in self._isolated_instances[client_id]:
                     VrpcAdapter.delete(instance_id)
                 del self._isolated_instances[client_id]
-            await self._client.unsubscribe(f"{self.domain}/{client_id}/__clientInfo__")
+
+            # FIX: Also clean up shared instance tracking
+            if client_id in self._shared_instances:
+                del self._shared_instances[client_id]
+
+            await self._client.unsubscribe(topic)
             self.emit("clientGone", client_id)
 
     async def _register_isolated_instance(self, instance_id, client_id):
         """Tracks an isolated instance and the client who created it."""
-        if (
-            not self._isolated_instances[client_id]
-            and not self._shared_instances[client_id]
-        ):
-            await self._client.subscribe(
-                f"{self.domain}/{client_id}/__clientInfo__", qos=self.qos
-            )
+        if not self._isolated_instances.get(
+            client_id
+        ) and not self._shared_instances.get(client_id):
+            subscription_topic = f"{client_id}/__clientInfo__"
+            await self._client.subscribe(subscription_topic, qos=self.qos)
             logger.info(f"Tracking lifetime of client: {client_id}")
         self._isolated_instances[client_id].add(instance_id)
+
+    async def _register_shared_instance(self, instance_id, client_id):
+        """Tracks a shared instance and the client who created it."""
+        if not self._isolated_instances.get(
+            client_id
+        ) and not self._shared_instances.get(client_id):
+            subscription_topic = f"{client_id}/__clientInfo__"
+            await self._client.subscribe(subscription_topic, qos=self.qos)
+            logger.info(f"Tracking lifetime of client: {client_id}")
+        self._shared_instances[client_id].add(instance_id)
 
     def _handle_vrpc_callback(self, data: dict):
         """Callback from VrpcAdapter to send results back to the caller."""
@@ -288,7 +304,7 @@ class VrpcAgent(EventEmitter):
             {k: v for k, v in data.items() if k in ("a", "r", "e", "i", "v")}
         )
 
-        if self._client:
+        if self._client and self._client.is_connected:
             asyncio.create_task(self._client.publish(topic, payload, qos=self.qos))
 
     def _generate_topics(self):
