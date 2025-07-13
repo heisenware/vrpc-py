@@ -9,8 +9,7 @@ import platform
 from argparse import ArgumentParser
 from collections import defaultdict
 
-from gmqtt import Client as MqttClient
-from gmqtt import Message
+import aiomqtt
 
 from .adapter import EventEmitter, VrpcAdapter
 
@@ -38,8 +37,6 @@ class VrpcAgent(EventEmitter):
         mqtt_client_id: str = None,
     ):
         super().__init__()
-        self._validate_domain(domain)
-        self._validate_agent(agent)
 
         self.agent = agent or self._generate_agent_name()
         self.domain = domain
@@ -49,6 +46,10 @@ class VrpcAgent(EventEmitter):
         self.token = token
         self.version = version
         self.qos = 0 if best_effort else 1
+
+        self._validate_domain(self.domain)
+        self._validate_agent(self.agent)
+
         self.mqtt_client_id = mqtt_client_id or self._generate_mqtt_client_id()
         self.base_topic = f"{self.domain}/{self.agent}"
 
@@ -102,56 +103,63 @@ class VrpcAgent(EventEmitter):
 
     async def serve(self):
         """Connects the agent to the broker and starts serving."""
-        username = self.username
-        password = self.password
-        if self.token:
-            username = f"{self.domain}/{self.agent}"
-            password = self.token
-
-        self._client = MqttClient(self.mqtt_client_id)
-        self._client.set_auth_credentials(username, password)
-
-        self._client.will_message = Message(
+        will = aiomqtt.Will(
             topic=f"{self.base_topic}/__agentInfo__",
             payload=self._create_agent_info_payload(status="offline"),
             qos=self.qos,
             retain=True,
         )
-
-        self._client.on_connect = self._handle_connect
-        self._client.on_message = self._handle_message
-        self._client.on_disconnect = lambda *args: self.emit("close")
-
-        host, port_str = (
-            self.broker.replace("mqtts://", "").replace("mqtt://", "").split(":")
-        )
-        logger.info(f"Connecting agent '{self.agent}' to {self.broker}...")
-        await self._client.connect(
-            host, int(port_str), ssl=self.broker.startswith("mqtts")
-        )
-        await asyncio.Event().wait()
+        try:
+            async with aiomqtt.Client(
+                hostname=self.broker.split("://")[1].split(":")[0],
+                port=int(self.broker.split(":")[-1]),
+                username=self.username,
+                password=self.password,
+                identifier=self.mqtt_client_id,  # FIX: Was client_id
+                will=will,
+                tls_params=aiomqtt.TLSParameters() if "mqtts" in self.broker else None,
+            ) as client:
+                self._client = client
+                await self._handle_connect()
+                logger.info(
+                    f"Agent '{self.agent}' connected and listening for messages."
+                )
+                async for message in client.messages:
+                    await self._handle_message(message)
+        except aiomqtt.MqttError as error:
+            logger.error(f"MQTT Connection Error: '{error}'.")
+            # Re-raise the error so tests can catch it
+            raise
 
     async def end(self, unregister: bool = False):
         """Stops the agent and disconnects from the broker."""
-        if not self._client or not self._client.is_connected:
+        if not self._client:
             self.emit("end")
             return
-
         agent_info_topic = f"{self.base_topic}/__agentInfo__"
-        self._client.publish(
+        await self._client.publish(
             agent_info_topic,
-            self._create_agent_info_payload(status="offline"),
+            payload=self._create_agent_info_payload(status="offline"),
             qos=self.qos,
             retain=True,
         )
         if unregister:
-            self._client.publish(agent_info_topic, "", qos=self.qos, retain=True)
+            await self._client.publish(
+                agent_info_topic, payload="", qos=self.qos, retain=True
+            )
             for class_name in VrpcAdapter.get_available_classes():
-                class_info_topic = f"{self.base_topic}/{class_name}/__classInfo__"
-                concise_topic = f"{self.base_topic}/{class_name}/__classInfoConcise__"
-                self._client.publish(class_info_topic, "", qos=self.qos, retain=True)
-                self._client.publish(concise_topic, "", qos=self.qos, retain=True)
-        await self._client.disconnect()
+                await self._client.publish(
+                    f"{self.base_topic}/{class_name}/__classInfo__",
+                    payload="",
+                    qos=self.qos,
+                    retain=True,
+                )
+                await self._client.publish(
+                    f"{self.base_topic}/{class_name}/__classInfoConcise__",
+                    payload="",
+                    qos=self.qos,
+                    retain=True,
+                )
         self.emit("end")
 
     def create(
@@ -165,77 +173,85 @@ class VrpcAgent(EventEmitter):
         obj = VrpcAdapter.create(
             class_name=class_name, instance=instance, args=args, is_isolated=is_isolated
         )
-        if self._client and self._client.is_connected:
-            self._publish_class_info(class_name)
-            self._publish_class_info_concise(class_name)
+        if self._client:
+            asyncio.create_task(self._publish_class_info(class_name))
+            asyncio.create_task(self._publish_class_info_concise(class_name))
         return obj
 
-    async def _ensure_connected(self):
-        """Waits until the client is connected."""
-        if self._client and self._client.is_connected:
-            return
-        connected_future = asyncio.get_event_loop().create_future()
-
-        def on_connect(*args, **kwargs):
-            if not connected_future.done():
-                connected_future.set_result(True)
-
-        self.on("connect", on_connect)
-        await connected_future
-        self.off("connect", on_connect)
-
-    def _handle_connect(self, client, flags, rc, properties):
+    async def _handle_connect(self):
         """Callback on successful connection to the MQTT broker."""
-        logger.info("Agent connected successfully.")
         self.emit("connect")
         topics = self._generate_topics()
         for topic in topics:
-            client.subscribe(topic, qos=self.qos)
+            await self._client.subscribe(topic, qos=self.qos)
         for class_name in VrpcAdapter.get_available_classes():
             for instance_name in VrpcAdapter.get_available_instances(class_name):
-                self._subscribe_to_instance_methods(class_name, instance_name)
-        self._publish_agent_info()
+                await self._subscribe_to_instance_methods(class_name, instance_name)
+        await self._publish_agent_info()
         for class_name in VrpcAdapter.get_available_classes():
-            self._publish_class_info(class_name)
-            self._publish_class_info_concise(class_name)
+            await self._publish_class_info(class_name)
+            await self._publish_class_info_concise(class_name)
 
-    def _handle_message(self, client, topic, payload, qos, properties):
+    async def _handle_message(self, message: aiomqtt.Message):
         """Callback for incoming MQTT messages."""
+        topic = message.topic.value
         logger.debug(f"Agent received message on topic: {topic}")
         try:
-            json_obj = json.loads(payload)
-            tokens = topic.split("/")
-            if len(tokens) >= 4 and tokens[3] == "__clientInfo__":
-                self._handle_client_info_message(topic, json_obj)
+            json_str = message.payload.decode("utf-8")
+            if not json_str:  # Handle empty retained messages on unregister
                 return
+            json_obj = json.loads(json_str)
+            tokens = topic.split("/")
+
+            if len(tokens) >= 4 and tokens[3] == "__clientInfo__":
+                await self._handle_client_info_message(topic, json_obj)
+                return
+
             _, _, class_name, instance, method = tokens
             json_obj["c"] = class_name if instance == "__static__" else instance
             json_obj["f"] = method
-            VrpcAdapter.call(json.dumps(json_obj))
+            mutated_json_str = json.dumps(json_obj)
+
+            result_json_str = VrpcAdapter.call(mutated_json_str)
+            result_obj = json.loads(result_json_str)
+
+            is_promise = isinstance(result_obj.get("r"), str) and result_obj[
+                "r"
+            ].startswith("__p__")
+            if not is_promise:
+                reply_topic = result_obj.get("s")
+                if reply_topic:
+                    await self._client.publish(
+                        reply_topic, result_json_str, qos=self.qos
+                    )
+
             if method == "__createIsolated__":
-                instance_name = json_obj.get("r")
-                client_id = json_obj.get("s")
+                instance_name = result_obj.get("r")
+                client_id = result_obj.get("s")
                 if instance_name and client_id:
-                    self._subscribe_to_instance_methods(class_name, instance_name)
-                    self._register_isolated_instance(instance_name, client_id)
+                    await self._subscribe_to_instance_methods(class_name, instance_name)
+                    await self._register_isolated_instance(instance_name, client_id)
             elif method == "__createShared__":
-                instance_name = json_obj.get("r")
+                instance_name = result_obj.get("r")
                 if instance_name:
-                    self._subscribe_to_instance_methods(class_name, instance_name)
-                    self._publish_class_info(class_name)
-                    self._publish_class_info_concise(class_name)
+                    await self._subscribe_to_instance_methods(class_name, instance_name)
+                    await self._publish_class_info(class_name)
+                    await self._publish_class_info_concise(class_name)
             elif method == "__delete__":
                 instance_name = json_obj.get("a", [None])[0]
                 if instance_name:
-                    self._unsubscribe_from_instance_methods(class_name, instance_name)
-                    self._publish_class_info(class_name)
-                    self._publish_class_info_concise(class_name)
+                    await self._unsubscribe_from_instance_methods(
+                        class_name, instance_name
+                    )
+                    await self._publish_class_info(class_name)
+                    await self._publish_class_info_concise(class_name)
+
         except Exception as e:
             logger.error(
                 f"Failed to handle message on topic {topic}: {e}", exc_info=True
             )
 
-    def _handle_client_info_message(self, topic, json_obj):
+    async def _handle_client_info_message(self, topic, json_obj):
         """Handles a client's status message (e.g., going offline)."""
         if json_obj.get("status") == "offline":
             client_id = "/".join(topic.split("/")[1:-1])
@@ -244,16 +260,16 @@ class VrpcAgent(EventEmitter):
                 for instance_id in self._isolated_instances[client_id]:
                     VrpcAdapter.delete(instance_id)
                 del self._isolated_instances[client_id]
-            self._client.unsubscribe(f"{self.domain}/{client_id}/__clientInfo__")
+            await self._client.unsubscribe(f"{self.domain}/{client_id}/__clientInfo__")
             self.emit("clientGone", client_id)
 
-    def _register_isolated_instance(self, instance_id, client_id):
+    async def _register_isolated_instance(self, instance_id, client_id):
         """Tracks an isolated instance and the client who created it."""
         if (
             not self._isolated_instances[client_id]
             and not self._shared_instances[client_id]
         ):
-            self._client.subscribe(
+            await self._client.subscribe(
                 f"{self.domain}/{client_id}/__clientInfo__", qos=self.qos
             )
             logger.info(f"Tracking lifetime of client: {client_id}")
@@ -261,43 +277,55 @@ class VrpcAgent(EventEmitter):
 
     def _handle_vrpc_callback(self, data: dict):
         """Callback from VrpcAdapter to send results back to the caller."""
-        sender_id = data.get("s")
-        if not sender_id:
-            return
-        topic = f"{self.domain}/{sender_id}/-/client/callback"
+        topic = data.get("s")
+        if not topic:
+            topic = data.get("i")
+            if not topic or not topic.startswith("__e__"):
+                return
+            topic = topic[5:]
+
         payload = json.dumps(
-            {k: v for k, v in data.items() if k in ("a", "r", "e", "i")}
+            {k: v for k, v in data.items() if k in ("a", "r", "e", "i", "v")}
         )
-        self._client.publish(topic, payload, qos=self.qos)
+
+        if self._client:
+            asyncio.create_task(self._client.publish(topic, payload, qos=self.qos))
 
     def _generate_topics(self):
         """Generates a list of topics for all static functions."""
         topics = []
         for class_name in VrpcAdapter.get_available_classes():
-            for func in VrpcAdapter._function_registry.get(class_name, {}).get(
-                "static_functions", []
-            ):
+            entry = VrpcAdapter._function_registry.get(class_name, {})
+            for func in entry.get("static_functions", []):
                 topics.append(f"{self.base_topic}/{class_name}/__static__/{func}")
+            topics.append(
+                f"{self.base_topic}/{class_name}/__static__/__createIsolated__"
+            )
+            topics.append(f"{self.base_topic}/{class_name}/__static__/__createShared__")
+            topics.append(f"{self.base_topic}/{class_name}/__static__/__delete__")
+            topics.append(f"{self.base_topic}/{class_name}/__static__/__callAll__")
         return topics
 
-    def _subscribe_to_instance_methods(self, class_name, instance_name):
+    async def _subscribe_to_instance_methods(self, class_name, instance_name):
         """Subscribes to all public methods of a new class instance."""
-        self._client.subscribe(
+        await self._client.subscribe(
             f"{self.base_topic}/{class_name}/{instance_name}/+", qos=self.qos
         )
 
-    def _unsubscribe_from_instance_methods(self, class_name, instance_name):
+    async def _unsubscribe_from_instance_methods(self, class_name, instance_name):
         """Unsubscribes from an instance's methods upon deletion."""
-        self._client.unsubscribe(f"{self.base_topic}/{class_name}/{instance_name}/+")
+        await self._client.unsubscribe(
+            f"{self.base_topic}/{class_name}/{instance_name}/+"
+        )
 
-    def _publish_agent_info(self):
+    async def _publish_agent_info(self):
         """Publishes the agent's online status and metadata."""
         payload = self._create_agent_info_payload(status="online")
-        self._client.publish(
+        await self._client.publish(
             f"{self.base_topic}/__agentInfo__", payload, qos=self.qos, retain=True
         )
 
-    def _publish_class_info(self, class_name):
+    async def _publish_class_info(self, class_name):
         """Publishes the full information about a registered class."""
         payload = {
             "className": class_name,
@@ -311,14 +339,14 @@ class VrpcAgent(EventEmitter):
             "meta": VrpcAdapter.get_meta_data(class_name),
             "v": VRPC_PROTOCOL_VERSION,
         }
-        self._client.publish(
+        await self._client.publish(
             f"{self.base_topic}/{class_name}/__classInfo__",
             json.dumps(payload),
             qos=self.qos,
             retain=True,
         )
 
-    def _publish_class_info_concise(self, class_name):
+    async def _publish_class_info_concise(self, class_name):
         """Publishes concise information about a registered class."""
         payload = {
             "className": class_name,
@@ -331,7 +359,7 @@ class VrpcAgent(EventEmitter):
             ),
             "v": VRPC_PROTOCOL_VERSION,
         }
-        self._client.publish(
+        await self._client.publish(
             f"{self.base_topic}/{class_name}/__classInfoConcise__",
             json.dumps(payload),
             qos=self.qos,
@@ -374,9 +402,7 @@ class VrpcAgent(EventEmitter):
 
     def _validate_agent(self, agent):
         """Validates the agent string."""
-        if not agent:
-            raise ValueError("Agent must be specified")
-        if any(c in agent for c in "+/#*"):
+        if agent and any(c in agent for c in "+/#*"):
             raise ValueError(
                 'Agent must NOT contain any of those characters: "+, /, #, *"'
             )

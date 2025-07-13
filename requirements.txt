@@ -1,7 +1,10 @@
-# tests/agent/requirements.txt
-gmqtt
+# vrpc/adapter.py dependencies
 nanoid
 docstring-parser
+
+# MQTT client for Agent/Client (asyncio compatible)
+aiomqtt
+
+# Testing dependencies
 pytest
 pytest-asyncio
-pytest-mock
