@@ -1,7 +1,7 @@
-# tests/fixtures/test_class_no_doc.py
+# tests/fixtures/sample_class_no_doc.py
 
 
-class TestClassNoDoc:
+class SampleClassNoDoc:
     def __init__(self, value=0):
         self._value = value
 

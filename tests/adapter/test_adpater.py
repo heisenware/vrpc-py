@@ -2,7 +2,7 @@
 
 import pytest
 
-from tests.adapter.fixtures.test_class_no_doc import TestClassNoDoc
+from tests.adapter.fixtures.sample_class_no_doc import SampleClassNoDoc
 
 # Assuming your vrpc package is in the project root
 from vrpc.adapter import VrpcAdapter
@@ -26,22 +26,22 @@ def clean_adapter():
 
 
 def test_manual_registration_of_a_class_given_a_class():
-    VrpcAdapter.register(TestClassNoDoc)
-    assert VrpcAdapter.get_available_classes() == ["TestClassNoDoc"]
+    VrpcAdapter.register(SampleClassNoDoc)
+    assert VrpcAdapter.get_available_classes() == ["SampleClassNoDoc"]
 
 
 def test_manual_registration_of_a_class_given_a_path():
     # pytest automatically makes the path relative to the root
-    VrpcAdapter.register("tests/adapter/fixtures/test_class_doc.py")
-    assert VrpcAdapter.get_available_classes() == ["TestClassDoc"]
+    VrpcAdapter.register("tests/adapter/fixtures/sample_class_doc.py")
+    assert VrpcAdapter.get_available_classes() == ["SampleClassDoc"]
 
 
 def test_manual_registration_of_an_instance():
-    test_instance = TestClassNoDoc(42)
+    test_instance = SampleClassNoDoc(42)
     VrpcAdapter.register_instance(
-        test_instance, class_name="TestClassNoDoc", instance="noDoc1"
+        test_instance, class_name="SampleClassNoDoc", instance="noDoc1"
     )
-    assert VrpcAdapter.get_available_instances("TestClassNoDoc") == ["noDoc1"]
+    assert VrpcAdapter.get_available_instances("SampleClassNoDoc") == ["noDoc1"]
 
 
 # --- Creation / Deletion and Availability Tests ---
@@ -53,51 +53,51 @@ def test_creation_should_not_create_instance_of_non_existing_class():
 
 
 def test_creation_with_minimal_parameters():
-    VrpcAdapter.register(TestClassNoDoc)
+    VrpcAdapter.register(SampleClassNoDoc)
     # In Python, we can use a simple list to "spy" on events
     create_events = []
     VrpcAdapter._emitter.on("create", lambda data: create_events.append(data))
 
-    instance = VrpcAdapter.create(class_name="TestClassNoDoc")
+    instance = VrpcAdapter.create(class_name="SampleClassNoDoc")
 
     assert instance.get_value() == 0
     # One instance was created automatically
-    assert len(VrpcAdapter.get_available_instances("TestClassNoDoc")) == 1
+    assert len(VrpcAdapter.get_available_instances("SampleClassNoDoc")) == 1
 
     # Check event emission
     assert len(create_events) == 1
     event_data = create_events[0]
-    assert event_data["className"] == "TestClassNoDoc"
+    assert event_data["className"] == "SampleClassNoDoc"
     assert not event_data["isIsolated"]
 
 
 def test_creation_with_specific_instance_name_and_args():
-    VrpcAdapter.register(TestClassNoDoc)
+    VrpcAdapter.register(SampleClassNoDoc)
     instance = VrpcAdapter.create(
-        class_name="TestClassNoDoc", instance="myInstance1", args=[42]
+        class_name="SampleClassNoDoc", instance="myInstance1", args=[42]
     )
     assert instance.get_value() == 42
-    assert VrpcAdapter.get_available_instances("TestClassNoDoc") == ["myInstance1"]
+    assert VrpcAdapter.get_available_instances("SampleClassNoDoc") == ["myInstance1"]
 
 
 def test_creation_in_isolated_mode():
-    VrpcAdapter.register(TestClassNoDoc)
-    VrpcAdapter.create(class_name="TestClassNoDoc", instance="myInstance1", args=[42])
+    VrpcAdapter.register(SampleClassNoDoc)
+    VrpcAdapter.create(class_name="SampleClassNoDoc", instance="myInstance1", args=[42])
     VrpcAdapter.create(
-        class_name="TestClassNoDoc",
+        class_name="SampleClassNoDoc",
         instance="isolatedInstance",
         args=[-1],
         is_isolated=True,
     )
     # Isolated instances should not appear in the public list
-    assert VrpcAdapter.get_available_instances("TestClassNoDoc") == ["myInstance1"]
+    assert VrpcAdapter.get_available_instances("SampleClassNoDoc") == ["myInstance1"]
     # But the instance should exist internally
     assert len(VrpcAdapter._instances) == 2
 
 
 def test_deletion_of_an_instance():
-    VrpcAdapter.register(TestClassNoDoc)
-    VrpcAdapter.create(class_name="TestClassNoDoc", instance="instance-to-delete")
+    VrpcAdapter.register(SampleClassNoDoc)
+    VrpcAdapter.create(class_name="SampleClassNoDoc", instance="instance-to-delete")
     assert len(VrpcAdapter._instances) == 1
 
     # Test deletion
@@ -113,28 +113,33 @@ def test_deletion_of_an_instance():
 # --- Documentation Parsing Tests ---
 
 
-def test_documentation_parsing():
-    VrpcAdapter.register("tests/adapter/fixtures/test_class_doc.py")
-    meta = VrpcAdapter.get_meta_data("TestClassDoc")
+def test_documentation_parsing_for_parity_with_js():
+    VrpcAdapter.register("tests/adapter/fixtures/sample_class_doc.py")
+    meta = VrpcAdapter.get_meta_data("SampleClassDoc")
 
-    # Check that the correct function keys were parsed
-    assert list(meta.keys()) == ["__createShared__", "get_value", "set_value"]
-
-    # Check constructor (__createShared__) metadata
-    constructor_meta = meta["__createShared__"]
-    assert constructor_meta["description"] == "Initializes the TestClassDoc."
-    assert len(constructor_meta["params"]) == 1
-    assert constructor_meta["params"][0]["arg_name"] == "value"
-    assert constructor_meta["params"][0]["type_name"] == "int"
-    assert (
-        constructor_meta["params"][0]["description"] == "Initial value. Defaults to 0."
+    assert sorted(list(meta.keys())) == sorted(
+        ["__createShared__", "get_value", "set_value"]
     )
-    assert constructor_meta["params"][0]["default"] == "0"
 
-    # Check setValue metadata
+    constructor_meta = meta["__createShared__"]
+    assert constructor_meta["description"] == "Constructor"
+    assert len(constructor_meta["params"]) == 2
+
+    # Check injected instanceName parameter
+    assert constructor_meta["params"][0]["name"] == "instanceName"
+    assert constructor_meta["params"][0]["type"] == "string"
+    assert constructor_meta["params"][0]["optional"] is False
+
+    # Check original constructor parameter
+    assert constructor_meta["params"][1]["name"] == "value"
+    assert constructor_meta["params"][1]["type"] == "int"
+    assert constructor_meta["params"][1]["default"] == "0"
+    assert constructor_meta["params"][1]["optional"] is True
+
+    # Check set_value metadata
     set_value_meta = meta["set_value"]
-    assert set_value_meta["description"] == "Sets a value."
+    assert set_value_meta["description"] == "Sets a value"
     assert len(set_value_meta["params"]) == 1
-    assert set_value_meta["params"][0]["arg_name"] == "value"
-    assert set_value_meta["returns"]["type_name"] == "int"
-    assert set_value_meta["returns"]["description"] == "The updated value."
+    assert set_value_meta["params"][0]["name"] == "value"
+    assert set_value_meta["ret"]["type"] == "int"
+    assert set_value_meta["ret"]["description"] == "the updated value"

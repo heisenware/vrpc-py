@@ -86,6 +86,36 @@ class VrpcAdapter:
     # --- Public API ---
 
     @classmethod
+    def add_plugin_path(cls, dir_path, max_level=float("inf"), current_level=0):
+        """
+        Recursively searches for and imports .py files to trigger auto-registration.
+
+        :param dir_path: The directory path to start the search from.
+        :param max_level: Maximum recursion depth.
+        :param current_level: The current depth of the search.
+        """
+        if current_level >= max_level:
+            return
+
+        p = Path(dir_path)
+        if not p.is_dir():
+            return
+
+        for file_path in p.iterdir():
+            if file_path.is_dir():
+                cls.add_plugin_path(str(file_path), max_level, current_level + 1)
+            elif file_path.is_file() and file_path.suffix == ".py":
+                try:
+                    module_name = file_path.stem
+                    spec = importlib.util.spec_from_file_location(
+                        module_name, file_path
+                    )
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                except Exception as e:
+                    logging.warning(f"Failed to auto-register from {file_path}: {e}")
+
+    @classmethod
     def register(cls, code, only_public=True, with_new=True, schema=None):
         """
         Registers a class, making it remotely callable.
@@ -93,25 +123,27 @@ class VrpcAdapter:
         :param code: A class object or a string path to a Python module.
         :param only_public: If True, ignores methods starting with '_'.
         :param with_new: If True, instances are created like `Klass()`.
-                         (Note: In Python, this is the standard way, so this
-                         flag has less impact than in JS).
         :param schema: A JSON schema for constructor validation (not implemented yet).
         """
         if isinstance(code, str):
-            # Resolve path from the current working directory (project root)
             abs_path = Path(code).resolve()
-
-            # Dynamically import the module
+            if not abs_path.exists():
+                # Handle cases like "./fixtures/TestClassDoc" -> "./fixtures/TestClassDoc.py"
+                abs_path = Path(f"{code}.py").resolve()
             module_name = abs_path.stem
             spec = importlib.util.spec_from_file_location(module_name, abs_path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
 
-            # Find the class within the module (assuming one class per file for simplicity)
-            for name, obj in inspect.getmembers(module):
-                if inspect.isclass(obj) and obj.__module__ == module_name:
-                    cls._register_class(obj, only_public, with_new, schema)
-                    break
+            # Find a class that has the same name as the file (a common Python convention)
+            found_class = getattr(module, module_name, None)
+            if inspect.isclass(found_class):
+                cls._register_class(found_class, only_public, with_new, schema)
+            else:  # Fallback to finding the first class in the file
+                for name, obj in inspect.getmembers(module):
+                    if inspect.isclass(obj) and obj.__module__ == module_name:
+                        cls._register_class(obj, only_public, with_new, schema)
+                        break
         elif inspect.isclass(code):
             cls._register_class(code, only_public, with_new, schema)
         else:
@@ -131,7 +163,6 @@ class VrpcAdapter:
         if only_public:
             member_functions = [m for m in member_functions if not m.startswith("_")]
 
-        # If the class is not yet known, add a minimal entry
         if class_name not in cls._function_registry:
             cls._function_registry[class_name] = {
                 "Klass": obj.__class__,
@@ -139,6 +170,7 @@ class VrpcAdapter:
                 "static_functions": [],
                 "member_functions": member_functions,
                 "schema": None,
+                "meta": {},
             }
 
         cls._instances[instance] = {
@@ -151,12 +183,6 @@ class VrpcAdapter:
     def create(cls, class_name, instance=None, args=None, is_isolated=False):
         """
         Creates a new instance of a registered class.
-
-        :param class_name: Name of the class to instantiate.
-        :param instance: Name for the instance. If None, one is generated.
-        :param args: List of arguments for the constructor.
-        :param is_isolated: If True, the instance is only visible to the creator.
-        :return: The created instance object.
         """
         instance = instance or nanoid(size=8)
         args = args or []
@@ -175,9 +201,6 @@ class VrpcAdapter:
     def delete(cls, instance):
         """
         Deletes a managed instance.
-
-        :param instance: The name of the instance (string) or the object itself.
-        :return: True if deletion was successful, False otherwise.
         """
         if isinstance(instance, str):
             return cls._delete(instance)
@@ -206,16 +229,18 @@ class VrpcAdapter:
     @classmethod
     def get_available_classes(cls):
         """Returns a list of all registered class names."""
-        return list(cls._function_registry.keys())
+        return sorted(list(cls._function_registry.keys()))
 
     @classmethod
     def get_available_instances(cls, class_name):
         """Returns a list of non-isolated instances for a given class."""
-        return [
-            name
-            for name, data in cls._instances.items()
-            if data["class_name"] == class_name and not data["is_isolated"]
-        ]
+        return sorted(
+            [
+                name
+                for name, data in cls._instances.items()
+                if data["class_name"] == class_name and not data["is_isolated"]
+            ]
+        )
 
     @classmethod
     def on_callback(cls, callback):
@@ -226,9 +251,6 @@ class VrpcAdapter:
     def call(cls, json_string):
         """
         Main entry point for handling an RPC call.
-
-        :param json_string: The JSON string representing the RPC call.
-        :return: A JSON string with the synchronous result of the call.
         """
         json_obj = json.loads(json_string)
         cls._call(json_obj)
@@ -260,33 +282,100 @@ class VrpcAdapter:
             "meta": meta,
         }
 
-    # --- Add this new private helper method ---
+    # In vrpc/adapter.py, replace this entire method
+
     @classmethod
     def _parse_docstrings(cls, klass):
         """
-        Parses the docstrings of a class and its methods to generate metadata.
+        Parses docstrings and combines them with runtime signature inspection
+        to generate metadata that matches the JS version's output.
         """
         meta = {}
-        # Parse the class constructor's docstring
+
+        def get_signature_info(func):
+            """Helper to extract defaults and type annotations from a signature."""
+            try:
+                sig = inspect.signature(func)
+                info = {}
+                for param in sig.parameters.values():
+                    if param.name == "self":
+                        continue
+                    info[param.name] = {
+                        "default": param.default,
+                        "annotation": param.annotation,
+                    }
+                return info, sig.return_annotation
+            except (ValueError, TypeError):
+                return {}, inspect.Signature.empty
+
+        def normalize_params(params, sig_info):
+            """Converts docstring_parser output to the expected format."""
+            normalized = []
+            for p in params:
+                info = sig_info.get(p.arg_name, {})
+                default_val = info.get("default")
+                annotation = info.get("annotation")
+
+                is_optional = default_val is not inspect.Parameter.empty
+                type_name = getattr(annotation, "__name__", p.type_name)
+
+                normalized.append(
+                    {
+                        "name": p.arg_name,
+                        "optional": is_optional,
+                        "description": p.description,
+                        "type": type_name,
+                        "default": str(default_val) if is_optional else None,
+                    }
+                )
+            return normalized
+
+        def normalize_return(returns, return_annotation):
+            type_name = getattr(return_annotation, "__name__", None)
+            if not type_name and returns:
+                type_name = returns.type_name
+            if not type_name:
+                return None
+            return {
+                "description": returns.description if returns else "",
+                "type": type_name,
+            }
+
+        # --- Parse the constructor ---
         constructor_doc = inspect.getdoc(klass.__init__)
         if constructor_doc:
             parsed = parse(constructor_doc)
+            sig_info, return_annotation = get_signature_info(klass.__init__)
+            params = normalize_params(parsed.params, sig_info)
+
+            params.insert(
+                0,
+                {
+                    "name": "instanceName",
+                    "optional": False,
+                    "description": "Name of the instance to be created",
+                    "type": "string",
+                    "default": None,
+                },
+            )
             meta["__createShared__"] = {
-                "description": parsed.short_description,
-                "params": [p.__dict__ for p in parsed.params],
-                "returns": parsed.returns.__dict__ if parsed.returns else None,
+                "description": parsed.short_description or parsed.long_description,
+                "params": params,
+                "ret": normalize_return(parsed.returns, return_annotation),
             }
 
-        # Parse member functions' docstrings
+        # --- Parse member functions ---
         for name, func in inspect.getmembers(klass, predicate=inspect.isfunction):
-            if not name.startswith("_"):  # or based on your `only_public` logic
+            if not name.startswith("_") and name != "__init__":
                 doc = inspect.getdoc(func)
                 if doc:
                     parsed = parse(doc)
+                    sig_info, return_annotation = get_signature_info(func)
                     meta[name] = {
-                        "description": parsed.short_description,
-                        "params": [p.__dict__ for p in parsed.params],
-                        "returns": parsed.returns.__dict__ if parsed.returns else None,
+                        "description": parsed.short_description
+                        or parsed.long_description,
+                        "params": normalize_params(parsed.params, sig_info),
+                        "ret": normalize_return(parsed.returns, return_annotation),
                     }
         return meta
 
@@ -298,7 +387,6 @@ class VrpcAdapter:
             "__createIsolated__": cls._handle_create_isolated,
             "__createShared__": cls._handle_create_shared,
             "__delete__": cls._handle_delete,
-            # '__callAll__': cls._handle_call_all  # TODO when needed
         }
         handler = handlers.get(func, cls._handle_call)
         try:
@@ -309,7 +397,6 @@ class VrpcAdapter:
 
     @classmethod
     def _handle_create_shared(cls, json_obj):
-        """Handles creation of a shared instance."""
         try:
             class_name = json_obj["c"]
             instance_id, *args = json_obj["a"]
@@ -335,7 +422,6 @@ class VrpcAdapter:
 
     @classmethod
     def _handle_create_isolated(cls, json_obj):
-        """Handles creation of an isolated instance."""
         try:
             class_name = json_obj["c"]
             instance_id, *args = json_obj["a"]
@@ -361,7 +447,6 @@ class VrpcAdapter:
 
     @classmethod
     def _handle_delete(cls, json_obj):
-        """Handles deletion of an instance."""
         instance_name = json_obj["a"][0]
         cls._emitter.emit(
             "beforeDelete", {"instance": instance_name, "className": json_obj["c"]}
@@ -373,21 +458,18 @@ class VrpcAdapter:
 
     @classmethod
     def _handle_call(cls, json_obj):
-        """Handles a regular method call on an instance or a class."""
         context_name = json_obj["c"]
         func_name = json_obj["f"]
-
         args = cls._unwrap_arguments(json_obj)
 
-        # Determine if it's a static or member call
-        if context_name in cls._function_registry:  # Static call
+        if context_name in cls._function_registry:
             entry = cls._function_registry[context_name]
             target = entry["Klass"]
             func = getattr(target, func_name, None)
             if not (func and callable(func)):
                 raise AttributeError(f"Could not find static function: {func_name}")
             result = func(*args)
-        elif context_name in cls._instances:  # Member call
+        elif context_name in cls._instances:
             entry = cls._instances[context_name]
             target = entry["instance"]
             func = getattr(target, func_name, None)
@@ -397,7 +479,6 @@ class VrpcAdapter:
         else:
             raise ValueError(f"Could not find context: {context_name}")
 
-        # Handle async results
         if inspect.isawaitable(result):
             cls._handle_promise(json_obj, result)
         else:
@@ -405,7 +486,6 @@ class VrpcAdapter:
 
     @classmethod
     def _create(cls, class_name, instance_id, *args):
-        """Underlying instance creation logic."""
         if instance_id in cls._instances:
             return cls._instances[instance_id]["instance"]
 
@@ -414,15 +494,12 @@ class VrpcAdapter:
             raise ValueError(f'"{class_name}" is not a registered class')
 
         Klass = registry_entry["Klass"]
-        # In Python, instantiation is straightforward
         return Klass(*args)
 
     @classmethod
     def _delete(cls, instance_id):
-        """Underlying instance deletion logic."""
         if instance_id in cls._instances:
             del cls._instances[instance_id]
-            # Clean up any listeners associated with this instance
             if instance_id in cls._listeners:
                 del cls._listeners[instance_id]
             return True
@@ -430,24 +507,18 @@ class VrpcAdapter:
 
     @classmethod
     def _unwrap_arguments(cls, json_obj):
-        """
-        Deserializes arguments, replacing placeholders with real callbacks
-        and event listeners.
-        """
         unwrapped = []
         args = json_obj.get("a", [])
         client_id = json_obj.get("s")
 
         for arg in args:
             if isinstance(arg, str):
-                if arg.startswith("__f__"):  # Function callback
-                    # Create a partial function that already has the context
+                if arg.startswith("__f__"):
                     callback = partial(
                         cls._generate_callback, event_id=arg, client_id=client_id
                     )
                     unwrapped.append(callback)
-                elif arg.startswith("__e__"):  # Event listener
-                    # Event handling logic would be implemented here
+                elif arg.startswith("__e__"):
                     pass
                 else:
                     unwrapped.append(arg)
@@ -457,7 +528,6 @@ class VrpcAdapter:
 
     @classmethod
     def _generate_callback(cls, *inner_args, event_id, client_id):
-        """Generates a callable that sends a response back via the global callback."""
         if not cls._callback:
             logging.warning("VrpcAdapter has no callback handler set.")
             return
@@ -467,7 +537,6 @@ class VrpcAdapter:
 
     @classmethod
     def _handle_promise(cls, json_obj, awaitable):
-        """Handles awaitable (async) results from function calls."""
         if not cls._callback:
             logging.error("Cannot handle promise, no callback handler is set.")
             return
@@ -485,11 +554,15 @@ class VrpcAdapter:
 
         import asyncio
 
-        asyncio.create_task(await_and_callback())
+        # This requires an event loop to be running in the execution context
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(await_and_callback())
+        except RuntimeError:
+            logging.error("No running asyncio event loop to handle promise.")
 
     @classmethod
     def _extract_member_functions(cls, klass):
-        """Extracts callable member methods from a class."""
         return [
             name
             for name, func in inspect.getmembers(klass, predicate=inspect.isfunction)
@@ -498,7 +571,6 @@ class VrpcAdapter:
 
     @classmethod
     def _extract_static_functions(cls, klass):
-        """Extracts static and class methods from a class."""
         return [
             name
             for name, func in inspect.getmembers(klass)
