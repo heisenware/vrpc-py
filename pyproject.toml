@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vrpc-py"
-version = "1.0.0"
+name = "vrpc"
+version = "3.0.0"
 description = "Asynchronous remote procedure calls for Python over MQTT"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -44,7 +44,7 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://docs.heisenware.com/developers/vrpc"
+Homepage = "https://vrpc.io"
 Repository = "https://github.com/heisenware/vrpc-py"
 Issues = "https://github.com/heisenware/vrpc-py/issues"
 
