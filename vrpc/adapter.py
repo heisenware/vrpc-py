@@ -5,48 +5,12 @@ import importlib.util
 import inspect
 import json
 import logging
-from collections import defaultdict
-from functools import partial, wraps
+from functools import partial
 from pathlib import Path
 
 from docstring_parser import parse
 from nanoid import generate as nanoid
-
-
-# A simple EventEmitter implementation to match Node.js's functionality
-class EventEmitter:
-    def __init__(self):
-        self._listeners = defaultdict(list)
-
-    def on(self, event_name, listener):
-        self._listeners[event_name].append(listener)
-
-    def once(self, event_name, listener):
-        @wraps(listener)
-        def wrapper(*args, **kwargs):
-            self.off(event_name, wrapper)
-            return listener(*args, **kwargs)
-
-        self.on(event_name, wrapper)
-
-    def off(self, event_name, listener):
-        if event_name in self._listeners:
-            self._listeners[event_name] = [
-                l for l in self._listeners[event_name] if l != listener
-            ]
-
-    def emit(self, event_name, *args, **kwargs):
-        if event_name in self._listeners:
-            # Make a copy in case listeners are modified during emission
-            for listener in self._listeners[event_name][:]:
-                listener(*args, **kwargs)
-
-    def remove_all_listeners(self, event_name=None):
-        if event_name:
-            if event_name in self._listeners:
-                del self._listeners[event_name]
-        else:
-            self._listeners.clear()
+from pyee.asyncio import AsyncIOEventEmitter
 
 
 class VrpcAdapter:
@@ -58,7 +22,7 @@ class VrpcAdapter:
     # --- Static Member Initialization ---
     _function_registry = {}
     _instances = {}
-    _emitter = EventEmitter()
+    _emitter = AsyncIOEventEmitter()
     _callback = None
     _correlation_id = 0
     _listeners = {}

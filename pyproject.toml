@@ -31,7 +31,8 @@ classifiers = [
 dependencies = [
     "aiomqtt>=2.0.0",
     "nanoid>=2.0.0",
-    "docstring-parser>=0.15"
+    "docstring-parser>=0.15",
+    "pyee>=11.1.0"
 ]
 
 # Optional dependencies for development and testing

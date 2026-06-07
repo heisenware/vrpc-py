@@ -11,8 +11,7 @@ from contextlib import suppress
 
 import aiomqtt
 from nanoid import generate as nanoid
-
-from .adapter import EventEmitter
+from pyee.asyncio import AsyncIOEventEmitter as EventEmitter
 
 logger = logging.getLogger(__name__)
 

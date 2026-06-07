@@ -10,8 +10,9 @@ from argparse import ArgumentParser
 from collections import defaultdict
 
 import aiomqtt
+from pyee.asyncio import AsyncIOEventEmitter as EventEmitter
 
-from .adapter import EventEmitter, VrpcAdapter
+from .adapter import VrpcAdapter
 
 logger = logging.getLogger(__name__)
 
