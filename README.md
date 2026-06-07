@@ -1,10 +1,10 @@
-# vrpc-py
+# vrpc
 
 > **Variadic Remote Procedure Calls for Python**
 
-`vrpc-py` is an asynchronous, event-driven Remote Procedure Call (RPC) framework for Python. It allows you to seamlessly expose standard Python classes and functions over an MQTT message broker, making them instantly callable from anywhere in the world.
+`vrpc` is an asynchronous, event-driven Remote Procedure Call (RPC) framework for Python. It allows you to seamlessly expose standard Python classes and functions over an MQTT message broker, making them instantly callable from anywhere in the world.
 
-By leveraging MQTT and Python's `asyncio`, `vrpc-py` bypasses NATs, firewalls, and complex networking setups, allowing for bi-directional communication, dynamic object instantiation, and remote continuous event streaming.
+By leveraging MQTT and Python's `asyncio`, `vrpc` bypasses NATs, firewalls, and complex networking setups, allowing for bi-directional communication, dynamic object instantiation, and remote continuous event streaming.
 
 It is 100% protocol-compatible with the [Node.js / JS `vrpc` implementation](https://github.com/heisenware/vrpc).
 
@@ -18,10 +18,10 @@ It is 100% protocol-compatible with the [Node.js / JS `vrpc` implementation](htt
 
 ## 📦 Installation
 
-Since `vrpc-py` is modern Python package (PEP 621), you can install it directly via pip:
+Since `vrpc` is modern Python package (PEP 621), you can install it directly via pip:
 
 ```bash
-pip install vrpc-py
+pip install vrpc
 ```
 
 _Requirements: Python 3.8+_
