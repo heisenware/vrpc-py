@@ -27,4 +27,4 @@ services:
     command:
       - "sh"
       - "-c"
-      - "pip install -e . && pytest tests/agent/test_agent.py -v"
+      - "pip install -e .[test] && pytest tests/agent/test_agent.py -v"

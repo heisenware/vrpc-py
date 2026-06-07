@@ -143,3 +143,160 @@ def test_documentation_parsing_for_parity_with_js():
     assert set_value_meta["params"][0]["name"] == "value"
     assert set_value_meta["ret"]["type"] == "int"
     assert set_value_meta["ret"]["description"] == "the updated value"
+
+
+# --- Event Listener and Callbacks Tests  ---
+
+
+class DummyEmitter:
+    """A simple mock class simulating an event emitter."""
+
+    def __init__(self):
+        self.callbacks = {}
+
+    def on(self, event, callback):
+        self.callbacks[event] = callback
+
+    def off(self, event, callback):
+        if event in self.callbacks:
+            del self.callbacks[event]
+
+    def remove_all_listeners(self, event):
+        if event in self.callbacks:
+            del self.callbacks[event]
+
+    def trigger(self, event, *args):
+        if event in self.callbacks and self.callbacks[event]:
+            self.callbacks[event](*args)
+
+
+def test_adapter_registers_and_triggers_event_listener():
+    VrpcAdapter.register(DummyEmitter)
+    instance = VrpcAdapter.create("DummyEmitter", instance="emitter1")
+
+    # Mock the global callback used to send MQTT messages back
+    callbacks_received = []
+    VrpcAdapter.on_callback(lambda data: callbacks_received.append(data))
+
+    # Simulate the RPC call to register a listener (like .on("data", callback))
+    json_call = {
+        "c": "emitter1",
+        "f": "on",
+        "a": ["data", "__e__topic123"],
+        "s": "client-1",
+        "i": "msg-1",
+    }
+    must_track = VrpcAdapter._call(json_call)
+
+    # Adapter should report that we need to track this client's lifecycle
+    assert must_track is True
+    assert "emitter1" in VrpcAdapter._listeners
+    assert "__e__topic123" in VrpcAdapter._listeners["emitter1"]
+
+    # Trigger the event locally on the Python instance
+    instance.trigger("data", 42, "hello")
+
+    # Check if the global callback caught it with the correct VRPC payload
+    assert len(callbacks_received) == 1
+    assert callbacks_received[0]["i"] == "__e__topic123"
+    assert callbacks_received[0]["a"] == [42, "hello"]
+
+
+def test_adapter_unregisters_event_listener():
+    VrpcAdapter.register(DummyEmitter)
+    VrpcAdapter.create("DummyEmitter", instance="emitter1")
+
+    # Register the listener
+    VrpcAdapter._call(
+        {
+            "c": "emitter1",
+            "f": "on",
+            "a": ["data", "__e__topic123"],
+            "s": "client-1",
+            "i": "msg-1",
+        }
+    )
+
+    assert "__e__topic123" in VrpcAdapter._listeners["emitter1"]
+
+    # Simulate the RPC call to remove the listener (like .off("data", callback))
+    must_track = VrpcAdapter._call(
+        {
+            "c": "emitter1",
+            "f": "off",
+            "a": ["data", "__e__topic123"],
+            "s": "client-1",
+            "i": "msg-2",
+        }
+    )
+
+    # off() does not require tracking a new lifecycle
+    assert must_track is False
+    assert "emitter1" not in VrpcAdapter._listeners
+
+
+def test_adapter_unregisters_client_on_drop():
+    VrpcAdapter.register(DummyEmitter)
+    VrpcAdapter.create("DummyEmitter", instance="emitter1")
+
+    # Register a listener for client-1
+    VrpcAdapter._call(
+        {
+            "c": "emitter1",
+            "f": "on",
+            "a": ["data", "__e__topic123"],
+            "s": "client-1",
+            "i": "msg-1",
+        }
+    )
+
+    assert "emitter1" in VrpcAdapter._listeners
+
+    # Simulate client-1 dropping off the MQTT broker unexpectedly
+    # This mimics the Agent catching the '__clientInfo__' offline message
+    VrpcAdapter._unregister_client("client-1")
+
+    # The adapter should have safely wiped the memory and unregistered the function
+    assert "emitter1" not in VrpcAdapter._listeners
+
+    # --- __callAll__ Execution Tests  ---
+
+
+class CallAllTarget:
+    def __init__(self, value):
+        self.value = value
+
+    def get_value(self):
+        return self.value
+
+
+def test_adapter_executes_call_all():
+    VrpcAdapter.register(CallAllTarget)
+
+    # Create two shared instances and one isolated instance
+    VrpcAdapter.create("CallAllTarget", instance="target1", args=[10])
+    VrpcAdapter.create("CallAllTarget", instance="target2", args=[20])
+    VrpcAdapter.create(
+        "CallAllTarget", instance="target-isolated", args=[99], is_isolated=True
+    )
+
+    json_call = {
+        "c": "CallAllTarget",
+        "f": "__callAll__",
+        "a": ["get_value"],  # First arg is the method to execute
+        "s": "client-1",
+        "i": "msg-1",
+    }
+
+    VrpcAdapter._call(json_call)
+
+    # Results should be stored in 'r'
+    results = json_call.get("r")
+    assert results is not None
+    assert len(results) == 2  # The isolated instance must be excluded!
+
+    # Check that both shared instances returned their correct values
+    result_map = {res["id"]: res["val"] for res in results}
+    assert result_map["target1"] == 10
+    assert result_map["target2"] == 20
+    assert all(res["err"] is None for res in results)

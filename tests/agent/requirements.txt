@@ -1,7 +1,0 @@
-# tests/agent/requirements.txt
-aiomqtt
-nanoid
-docstring-parser
-pytest
-pytest-asyncio
-pytest-mock

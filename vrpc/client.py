@@ -37,6 +37,26 @@ class _VrpcProxy:
 
         return remote_method
 
+    async def vrpc_on(self, function_name, *args):
+        """Explicitly binds a continuous event listener to a remote function."""
+        # Wrap arguments specifically identifying as an event attachment
+        wrapped_args = await self._client._wrap_arguments(
+            self._agent,
+            self._class_name,
+            self._instance,
+            "vrpcOn",
+            [function_name, *args],
+        )
+        topic = f"{self._client.domain}/{self._agent}/{self._class_name}/{self._instance}/{function_name}"
+        # The payload executes `function_name`, but we drop the first wrapped arg (the function name itself)
+        return await self._client._execute_remote_call(
+            topic, {"c": self._instance, "f": function_name, "a": wrapped_args[1:]}
+        )
+
+    def vrpc_off(self, callback):
+        """Locally detaches a continuous event listener."""
+        self._client._off_remote_event(callback)
+
 
 class VrpcClient(EventEmitter):
     """Client for creating proxies and remotely calling functions."""
@@ -79,6 +99,8 @@ class VrpcClient(EventEmitter):
 
         self._agents = defaultdict(lambda: {"classes": {}})
         self._pending_calls = {}
+        self._pending_callbacks = {}
+        self._event_listeners = {}
         self._proxies = {}
         self._invoke_id = 0
         self._client = None
@@ -114,6 +136,61 @@ class VrpcClient(EventEmitter):
 
         self._background_task = asyncio.create_task(self._message_loop())
 
+    async def delete(self, instance: str, agent: str = None, class_name: str = None):
+        """Deletes a remote instance."""
+        if not self._client or not self._client._connected:
+            raise RuntimeError("Client is not connected")
+
+        if agent is None or class_name is None:
+            agent, class_name = await self._find_instance_info(
+                instance, agent, class_name
+            )
+
+        json_obj = {"c": class_name, "f": "__delete__", "a": [instance]}
+        topic = f"{self.domain}/{agent}/{class_name}/__static__/__delete__"
+
+        # Cleanup local proxy cache if it exists
+        if instance in self._proxies:
+            del self._proxies[instance]
+
+        return await self._execute_remote_call(topic, json_obj)
+
+    async def call_all(
+        self, class_name: str, function_name: str, args: list = None, agent: str = None
+    ):
+        """Calls a method on all shared instances of a class and aggregates the results."""
+        if not self._client or not self._client._connected:
+            raise RuntimeError("Client is not connected")
+
+        args = args or []
+        agent = agent or self.default_agent
+
+        # If agent is '*', broadcast across all online agents
+        if agent == "*":
+            results = []
+            for ag in self.get_available_agents():
+                wrapped = await self._wrap_arguments(
+                    ag, class_name, "__static__", function_name, args
+                )
+                json_obj = {
+                    "c": class_name,
+                    "f": "__callAll__",
+                    "a": [function_name, *wrapped],
+                }
+                topic = f"{self.domain}/{ag}/{class_name}/__static__/__callAll__"
+                res = await self._execute_remote_call(topic, json_obj)
+                if isinstance(res, list):
+                    results.extend(res)
+            return results
+
+        # Call on a specific agent
+        wrapped = await self._wrap_arguments(
+            agent, class_name, "__static__", function_name, args
+        )
+        json_obj = {"c": class_name, "f": "__callAll__", "a": [function_name, *wrapped]}
+        topic = f"{self.domain}/{agent}/{class_name}/__static__/__callAll__"
+        return await self._execute_remote_call(topic, json_obj)
+
     async def _message_loop(self):
         """The main loop for connecting and handling incoming messages."""
         try:
@@ -136,7 +213,7 @@ class VrpcClient(EventEmitter):
         info_topic = "__classInfo__" if self.requires_schema else "__classInfoConcise__"
         await self._client.subscribe(f"{self.domain}/{agent_filter}/+/{info_topic}")
 
-        await self._client.subscribe(self.vrpc_client_id)
+        await self._client.subscribe(f"{self.vrpc_client_id}/#")
         self.emit("connect")
 
     async def _handle_message(self, message: aiomqtt.Message):
@@ -149,22 +226,34 @@ class VrpcClient(EventEmitter):
             logger.warning(f"Could not decode message on topic: {topic}")
             return
 
-        if topic == self.vrpc_client_id:
-            call_id = payload.get("i")
-            if call_id in self._pending_calls:
-                future = self._pending_calls.pop(call_id)
-                if "e" in payload and payload["e"]:
-                    future.set_exception(
-                        RuntimeError(
-                            payload["e"].get("message", "Unknown remote error")
+        # Handle messages addressed directly to this client (RPC responses and callbacks)
+        if topic.startswith(self.vrpc_client_id):
+            if topic == self.vrpc_client_id:
+                call_id = payload.get("i")
+                if call_id in self._pending_calls:
+                    future = self._pending_calls.pop(call_id)
+                    if "e" in payload and payload["e"]:
+                        future.set_exception(
+                            RuntimeError(
+                                payload["e"].get("message", "Unknown remote error")
+                            )
                         )
-                    )
-                else:
-                    result = payload.get("r")
-                    if isinstance(result, str) and result.startswith("__p__"):
-                        self._pending_calls[result] = future
                     else:
-                        future.set_result(result)
+                        result = payload.get("r")
+                        if isinstance(result, str) and result.startswith("__p__"):
+                            self._pending_calls[result] = future
+                        else:
+                            future.set_result(result)
+                elif call_id in self._pending_callbacks:
+                    # Execute one-time remote function callback (__f__)
+                    callback = self._pending_callbacks.pop(call_id)
+                    callback(*payload.get("a", []))
+            else:
+                # Execute continuous event stream callback (__e__)
+                event_id = f"__e__{topic}"
+                if event_id in self._event_listeners:
+                    for callback in self._event_listeners[event_id]["listeners"]:
+                        callback(*payload.get("a", []))
             return
 
         tokens = topic.split("/")
@@ -298,13 +387,19 @@ class VrpcClient(EventEmitter):
         raise ValueError(f"Instance '{instance}' could not be found.")
 
     async def _call_static_remote_method(self, agent, class_name, function_name, args):
+        wrapped_args = await self._wrap_arguments(
+            agent, class_name, "__static__", function_name, args
+        )
         topic = f"{self.domain}/{agent}/{class_name}/__static__/{function_name}"
-        return await self._execute_remote_call(topic, {"a": args})
+        return await self._execute_remote_call(topic, {"a": wrapped_args})
 
     async def _call_remote_method(self, agent, instance, function_name, args):
         _, class_name = await self._find_instance_info(instance, agent=agent)
+        wrapped_args = await self._wrap_arguments(
+            agent, class_name, instance, function_name, args
+        )
         topic = f"{self.domain}/{agent}/{class_name}/{instance}/{function_name}"
-        return await self._execute_remote_call(topic, {"a": args})
+        return await self._execute_remote_call(topic, {"a": wrapped_args})
 
     async def _execute_remote_call(self, topic, json_obj):
         self._invoke_id += 1
@@ -323,3 +418,78 @@ class VrpcClient(EventEmitter):
         except asyncio.TimeoutError:
             self._pending_calls.pop(call_id, None)
             raise TimeoutError(f"Call to topic {topic} timed out (> {self.timeout}s)")
+
+    async def _wrap_arguments(self, agent, class_name, instance, function_name, args):
+        wrapped = []
+        is_continuous_emitter = function_name in (
+            "on",
+            "addListener",
+            "vrpcOn",
+        ) or function_name.startswith("on")
+        is_continuous_remover = function_name in ("off", "removeListener", "vrpcOff")
+
+        for i, arg in enumerate(args):
+            if callable(arg):
+                if is_continuous_emitter:
+                    event = (
+                        args[0]
+                        if len(args) > 0 and isinstance(args[0], str)
+                        else function_name
+                    )
+                    _id = self._on_remote_event(agent, class_name, instance, event, arg)
+                    wrapped.append(_id)
+                elif is_continuous_remover:
+                    _id = self._off_remote_event(arg)
+                    wrapped.append(_id)
+                else:
+                    # Regular one-time callback (__f__)
+                    self._invoke_id += 1
+                    remote_id = f"{agent}-{class_name}"
+                    _id = f"__f__{remote_id}-{function_name}-{i}-{self._invoke_id}"
+                    self._pending_callbacks[_id] = arg
+                    wrapped.append(_id)
+            else:
+                wrapped.append(arg)
+        return wrapped
+
+    def _on_remote_event(self, agent, class_name, instance, event, callback):
+        # Generate the 12-character MD5 hash for the sub-topic
+        callback_id = str(id(callback))
+        hash_input = (
+            f"{agent}-{class_name}-{instance or '__static__'}-{event}-{callback_id}"
+        )
+        topic_id = hashlib.md5(hash_input.encode()).hexdigest()[:12]
+
+        topic = f"{self.vrpc_client_id}/{topic_id}"
+        event_id = f"__e__{topic}"
+
+        if event_id not in self._event_listeners:
+            self._event_listeners[event_id] = {
+                "agent": agent,
+                "class_name": class_name,
+                "instance": instance,
+                "event": event,
+                "listeners": [callback],
+            }
+        else:
+            if callback not in self._event_listeners[event_id]["listeners"]:
+                self._event_listeners[event_id]["listeners"].append(callback)
+
+        return event_id
+
+    def _off_remote_event(self, callback):
+        # Find the listener and remove it
+        found_id = None
+        events_to_delete = []
+
+        for event_id, data in self._event_listeners.items():
+            if callback in data["listeners"]:
+                data["listeners"].remove(callback)
+                found_id = event_id
+                if not data["listeners"]:
+                    events_to_delete.append(event_id)
+
+        for event_id in events_to_delete:
+            del self._event_listeners[event_id]
+
+        return found_id

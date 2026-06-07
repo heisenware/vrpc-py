@@ -211,10 +211,22 @@ class VrpcAgent(EventEmitter):
             _, _, class_name, instance, method = tokens
             json_obj["c"] = class_name if instance == "__static__" else instance
             json_obj["f"] = method
-            mutated_json_str = json.dumps(json_obj)
+            must_track = VrpcAdapter._call(json_obj)
 
-            result_json_str = VrpcAdapter.call(mutated_json_str)
-            result_obj = json.loads(result_json_str)
+            # If a listener was added, ensure we are tracking the client's lifecycle
+            if must_track:
+                client_id = json_obj.get("s")
+                if client_id:
+                    # In aiomqtt, subscribe is an async operation, so we schedule it
+                    asyncio.create_task(
+                        self._client.subscribe(
+                            f"{client_id}/__clientInfo__", qos=self.qos
+                        )
+                    )
+
+            # Use the mutated object for the rest of the flow
+            result_obj = json_obj
+            result_json_str = json.dumps(result_obj)
 
             is_promise = isinstance(result_obj.get("r"), str) and result_obj[
                 "r"
@@ -304,7 +316,7 @@ class VrpcAgent(EventEmitter):
             {k: v for k, v in data.items() if k in ("a", "r", "e", "i", "v")}
         )
 
-        if self._client and self._client.is_connected:
+        if self._client:
             asyncio.create_task(self._client.publish(topic, payload, qos=self.qos))
 
     def _generate_topics(self):

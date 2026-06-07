@@ -17,15 +17,38 @@ class Foo:
         return "pong"
 
 
+class EventTestClass:
+    """A target class for testing remote callbacks and continuous events."""
+
+    def __init__(self):
+        self._cb = None
+
+    def on(self, event_name, callback):
+        self._cb = callback
+
+    def off(self, event_name, callback):
+        self._cb = None
+
+    def trigger(self, value):
+        if self._cb:
+            self._cb(value)
+
+    def do_callback(self, callback):
+        callback("direct callback")
+
+
 # This fixture ensures a clean adapter and registers the class for all tests
 @pytest.fixture(autouse=True)
 def clean_adapter():
     VrpcAdapter._function_registry.clear()
     VrpcAdapter._instances.clear()
+    VrpcAdapter._listeners.clear()
     VrpcAdapter.register(Foo)
+    VrpcAdapter.register(EventTestClass)
     yield
     VrpcAdapter._function_registry.clear()
     VrpcAdapter._instances.clear()
+    VrpcAdapter._listeners.clear()
 
 
 class TestAgentConstructionAndConnection:
@@ -205,6 +228,163 @@ class TestLocalInstanceCreation:
             assert result == "pong"
         finally:
             # FIX: Clean up all tasks robustly
+            await client.end()
+            await agent.end()
+            serve_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await serve_task
+
+
+@pytest.mark.asyncio
+class TestRemoteCallbacksAndEvents:
+    async def test_remote_callbacks_and_continuous_events(self):
+        agent = VrpcAgent(
+            broker="mqtt://broker:1883",
+            domain="test.vrpc",
+            agent="agent-event-test",
+            username="Erwin",
+            password="12345",
+        )
+        client = VrpcClient(
+            domain="test.vrpc",
+            broker="mqtt://broker:1883",
+            username="Erwin",
+            password="12345",
+        )
+
+        serve_task = asyncio.create_task(agent.serve())
+
+        try:
+            await client.connect()
+
+            # Wait briefly to ensure the agent is online and classInfo is populated
+            await asyncio.sleep(0.5)
+
+            # 1. Create a shared instance
+            proxy = await client.create(
+                agent="agent-event-test",
+                class_name="EventTestClass",
+                instance="emitter1",
+            )
+
+            # ---------------------------------------------------------
+            # TEST A: One-time Callback (__f__)
+            # ---------------------------------------------------------
+            callback_received = asyncio.Event()
+            callback_value = None
+
+            def one_time_cb(val):
+                nonlocal callback_value
+                callback_value = val
+                callback_received.set()
+
+            # Pass the python function to the remote method
+            await proxy.do_callback(one_time_cb)
+
+            # Wait for the MQTT roundtrip
+            await asyncio.wait_for(callback_received.wait(), timeout=2.0)
+            assert callback_value == "direct callback"
+
+            # ---------------------------------------------------------
+            # TEST B: Continuous Event Emitter (__e__)
+            # ---------------------------------------------------------
+            event_received = asyncio.Event()
+            event_value = None
+
+            def continuous_cb(val):
+                nonlocal event_value
+                event_value = val
+                event_received.set()
+
+            # Register the listener
+            await proxy.on("my_event", continuous_cb)
+
+            # Trigger the event remotely
+            await proxy.trigger("event payload")
+
+            # Wait for the MQTT roundtrip
+            await asyncio.wait_for(event_received.wait(), timeout=2.0)
+            assert event_value == "event payload"
+
+            # ---------------------------------------------------------
+            # TEST C: Continuous Event Removal (off)
+            # ---------------------------------------------------------
+            event_received.clear()
+            event_value = None
+
+            # Remove the listener
+            await proxy.off("my_event", continuous_cb)
+
+            # Trigger the event remotely again
+            await proxy.trigger("ghost payload")
+
+            # Allow a short buffer to ensure no ghost messages arrive
+            await asyncio.sleep(0.5)
+
+            # The event should NOT have been set, and the value should be unchanged
+            assert not event_received.is_set()
+            assert event_value is None
+
+        finally:
+            await client.end()
+            await agent.end()
+            serve_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await serve_task
+
+
+@pytest.mark.asyncio
+class TestCallAllExecution:
+    async def test_call_all_broadcasts_to_shared_instances(self):
+        agent = VrpcAgent(
+            broker="mqtt://broker:1883",
+            domain="test.vrpc",
+            agent="agent-callall-test",
+            username="Erwin",
+            password="12345",
+        )
+        client = VrpcClient(
+            domain="test.vrpc",
+            broker="mqtt://broker:1883",
+            username="Erwin",
+            password="12345",
+        )
+
+        serve_task = asyncio.create_task(agent.serve())
+
+        try:
+            await client.connect()
+
+            # Wait briefly to ensure the agent is online
+            await asyncio.sleep(0.5)
+
+            # 1. Create two shared instances
+            await client.create(
+                agent="agent-callall-test", class_name="Foo", instance="foo-1"
+            )
+            await client.create(
+                agent="agent-callall-test", class_name="Foo", instance="foo-2"
+            )
+
+            # Wait a tiny bit for the MQTT instanceNew/classInfo updates to sync
+            await asyncio.sleep(0.5)
+
+            # 2. Trigger the batch execution
+            results = await client.call_all(
+                agent="agent-callall-test", class_name="Foo", function_name="ping"
+            )
+
+            # 3. Verify the aggregated results
+            assert len(results) == 2
+
+            # Map results by instance ID for easy checking
+            result_map = {res["id"]: res["val"] for res in results}
+
+            assert result_map["foo-1"] == "pong"
+            assert result_map["foo-2"] == "pong"
+            assert all(res["err"] is None for res in results)
+
+        finally:
             await client.end()
             await agent.end()
             serve_task.cancel()
