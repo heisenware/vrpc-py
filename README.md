@@ -1,141 +1,125 @@
-# vrpc
+# VRPC Python
 
-> **Variadic Remote Procedure Calls for Python**
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI version](https://img.shields.io/pypi/v/vrpc.svg)](https://pypi.org/project/vrpc/)
 
-`vrpc` is an asynchronous, event-driven Remote Procedure Call (RPC) framework for Python. It allows you to seamlessly expose standard Python classes and functions over an MQTT message broker, making them instantly callable from anywhere in the world.
+**Stop writing API boilerplate.** VRPC (Virtual Remote Procedure Call) allows you to call Python, Node.js, C++, and Arduino classes across any network as if they were local objects. Perfect for microservices, exposing machine learning models, and directly driving React frontends—without the need for REST, GraphQL, or WebSocket boilerplate.
 
-By leveraging MQTT and Python's `asyncio`, `vrpc` bypasses NATs, firewalls, and complex networking setups, allowing for bi-directional communication, dynamic object instantiation, and remote continuous event streaming.
+This repository provides both the **Agent** (to expose your Python code) and the **Client** (to seamlessly control remote code from your Python scripts or Jupyter notebooks).
 
-It is 100% protocol-compatible with the [Node.js / JS `vrpc` implementation](https://github.com/heisenware/vrpc).
+---
 
-## ✨ Features
+## Why VRPC for Python?
 
-- **Zero Boilerplate:** Register existing Python classes without modifying their code.
-- **Fully Asynchronous:** Built from the ground up on modern `asyncio` and `aiomqtt`.
-- **Stateful Instances:** Create, manage, and delete remote object instances dynamically. Shared instances can be interacted with by multiple clients simultaneously.
-- **Remote Event Listeners:** Pass Python callables as arguments to remote functions. VRPC automatically binds them to MQTT streams (perfect for real-time sensor data or status updates).
-- **Batch Executions:** Broadcast method calls to all instances of a class across multiple distributed agents in a single line of code (`call_all`).
+- **Zero Boilerplate:** No Flask routers, no Pydantic schemas, and no payload parsing. Just register your standard Python class, and VRPC instantly makes its methods remotely callable.
+- **Native Event Proxies:** Don't just fetch data—stream it. VRPC transparently proxies Python callbacks across the network. When your data-science script completes a batch or emits a progress update, your React UI updates instantly.
+- **MQTT-Powered NAT Traversal:** Built on top of robust MQTT, agents make outbound connections to your broker. No CORS headaches, no complex reverse proxies, and perfect resilience on unstable networks.
+- **Perfect for AI & Data Science:** Expose heavy Pandas processing or PyTorch inference models running on a GPU cluster, and control them directly from a lightweight web server or frontend.
 
-## 📦 Installation
+## Installation
 
-Since `vrpc` is modern Python package (PEP 621), you can install it directly via pip:
+Install VRPC via pip:
 
 ```bash
 pip install vrpc
 ```
 
-_Requirements: Python 3.8+_
+## Quick Start
 
-## 🚀 Quick Start
+With VRPC, making a Python class remotely accessible requires almost zero API code.
 
-To use VRPC, you need two components: an **Agent** (which hosts your code) and a **Client** (which remotely calls it). Both connect to a central MQTT broker.
-
-### 1. The Agent (Server)
-
-First, write a standard Python class. Let's create a `Counter` that maintains state and can emit continuous events via a callback.
+### 1. Write and Expose your Python Class (Agent)
 
 ```python
-# agent.py
-import asyncio
+# backend.py
+import time
 from vrpc import VrpcAdapter, VrpcAgent
 
-class Counter:
-    def __init__(self, initial_value=0):
-        self._count = initial_value
-        self._callback = None
+class DataProcessor:
+    def __init__(self, dataset_name):
+        self.dataset_name = dataset_name
+        self.progress = 0
 
-    def on_change(self, callback):
-        """Registers a callback for continuous state updates."""
-        self._callback = callback
+    def process_data(self, factor):
+        print(f"Processing {self.dataset_name} with factor {factor}...")
+        time.sleep(2) # Simulate heavy work
+        return [x * factor for x in range(5)]
 
-    def increment(self, step=1):
-        """Increments the counter and triggers the callback."""
-        self._count += step
-        if self._callback:
-            self._callback(self._count)
-        return self._count
+    def on_progress(self, callback):
+        # VRPC seamlessly proxies this callback over the network!
+        for i in range(1, 6):
+            time.sleep(0.5)
+            self.progress = i * 20
+            callback(self.progress)
 
-# 1. Register the class so VRPC knows about it
-VrpcAdapter.register(Counter)
+# 1. Register the class
+VrpcAdapter.register(DataProcessor)
 
-async def main():
-    # 2. Configure the Agent to connect to a broker
-    agent = VrpcAgent(
-        domain="my.custom.domain",
-        agent="python-agent-1",
-        broker="mqtt://broker.hivemq.com:1883" # Public test broker
-    )
-
-    print("Agent is starting...")
-    await agent.serve()
-
+# 2. Start the Agent
 if __name__ == "__main__":
-    asyncio.run(main())
+    agent = VrpcAgent(
+        domain="my_domain",
+        agent="python_backend",
+        broker="mqtts://broker.hivemq.com:8883"
+    )
+    print("Python Backend is online!")
+    agent.serve()
 ```
 
-### 2. The Client
+### 2. Control it from Anywhere (e.g., Python / Node.js / React)
 
-Now, from a completely different machine, process, or network, we can connect a client, create an instance of that `Counter`, and interact with it.
+Once your Python agent is running, you can interact with it transparently from any VRPC client. Here is how you would call it from another Python script:
 
 ```python
 # client.py
-import asyncio
 from vrpc import VrpcClient
 
-async def main():
-    # 1. Connect to the same broker and domain
+def run():
     client = VrpcClient(
-        domain="my.custom.domain",
-        broker="mqtt://broker.hivemq.com:1883"
-    )
-    await client.connect()
-
-    # 2. Create a remote instance of the Counter
-    print("Creating remote Counter instance...")
-    counter = await client.create(
-        agent="python-agent-1",
-        class_name="Counter",
-        instance="my-shared-counter",
-        args=[10]  # Passes '10' to initial_value
+        domain="my_domain",
+        broker="mqtts://broker.hivemq.com:8883"
     )
 
-    # 3. Define a local function to handle remote events
-    def handle_update(new_val):
-        print(f" -> Continuous Event Received! Counter is now: {new_val}")
+    # Create a remote instance of your Python class
+    processor = client.create(
+        agent="python_backend",
+        class_name="DataProcessor",
+        args=["sales_data_2026"]
+    )
 
-    # VRPC magically wires this Python function over MQTT
-    await counter.on_change(handle_update)
+    # Listen to remote callbacks across the network!
+    def handle_progress(percent):
+        print(f"Remote progress: {percent}%")
 
-    # 4. Call remote methods
-    print("Calling increment(5)...")
-    result = await counter.increment(5)
-    print(f"RPC Returned: {result}")
+    processor.on_progress(handle_progress)
 
-    # Cleanup
-    await client.end()
+    # Call functions natively
+    result = processor.process_data(42)
+    print(f"Processing complete. Result: {result}")
+
+    client.end()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()
 ```
 
-## 🏗 Architecture Concepts
+## The VRPC Ecosystem
 
-VRPC organizes remote execution using a specific hierarchy:
+Write your performance-critical code in **C++**, your data-science scripts in **Python**, your business logic in **Node.js**, and your IoT firmware on **Arduino**. Call them all identically.
 
-- **Domain:** The highest level of isolation. Agents and Clients must share the same domain to see each other.
-- **Agent:** A physical process hosting VRPC code. A single domain can have hundreds of distributed agents.
-- **Class:** A registered Python class available for instantiation.
-- **Instance:** A specific, stateful object created from a Class. Instances can be **Shared** (visible to all clients) or **Isolated** (visible only to the client that created it).
+- [VRPC for Node.js / Browser](https://github.com/heisenware/vrpc-js)
+- [VRPC for C++](https://github.com/heisenware/vrpc-cpp)
+- [VRPC for Arduino / ESP32](https://github.com/heisenware/vrpc-arduino)
+- [VRPC for React](https://github.com/heisenware/vrpc-react)
 
-## 🤝 Contributing
+## Documentation
 
-Contributions, issues, and feature requests are welcome!
+For detailed API references, advanced schema validation, and architecture overviews, please visit our official documentation at **[vrpc.io/docs](https://vrpc.io/docs)**.
 
-1. Fork the project.
-2. Install with test dependencies: `pip install -e .[test]`
-3. Run local adapter tests: `pytest tests/adapter/test_adapter.py`
-4. Run integration tests (requires Docker): `cd tests/agent && ./test.sh`
+## Contributing
 
-## 📝 License
+Contributions are welcome! Whether it's reporting a bug, proposing a new feature, or submitting a pull request, we'd love your help to make VRPC even better. Please read our [Contributing Guidelines](CONTRIBUTING.md) to get started.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## License
+
+VRPC is released under the [MIT License](LICENSE).
